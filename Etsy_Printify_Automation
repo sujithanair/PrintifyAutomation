@@ -1,0 +1,310 @@
+
+import os
+import re
+import requests
+import json
+import mimetypes
+import base64
+from time import sleep
+# Load environment variables from .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # If dotenv is not installed, skip loading .env
+
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+
+# Path to your local folder with designs
+DESIGNS_FOLDER = "/Users/sujithanair/Desktop/PrintifyAutomation/Designs"
+
+
+# Your Printify API key is NOT stored in this script for security.
+# Rotate your Printify API key in the Printify dashboard and set it in your shell:
+#   export PRINTIFY_API_KEY="your-new-key"
+PRINTIFY_API_KEY = os.getenv("PRINTIFY_API_KEY")
+if not PRINTIFY_API_KEY:
+    raise RuntimeError("PRINTIFY_API_KEY environment variable is not set. Please set it with: export PRINTIFY_API_KEY=\"your-new-key\"")
+
+
+BLUEPRINT_NAME = "Unisex Ultra Cotton Tee"
+# PROVIDER_NAME is now selected dynamically in main()
+PUBLISH_DRAFT = True  # Set to False if you want to skip publishing
+
+# Delay between API calls (to avoid rate limits)
+API_DELAY = 1.0  # in seconds
+
+
+# ---------------------------
+# HELPER FUNCTIONS
+# ---------------------------
+
+def api_get(url, params=None):
+    headers = {"Authorization": f"Bearer {PRINTIFY_API_KEY}"}
+    resp = requests.get(url, headers=headers, params=params)
+    print(f"[GET] {url} -> {resp.status_code}")
+    return resp
+
+def api_post(url, data=None, json_data=None, extra_headers=None):
+    headers = {"Authorization": f"Bearer {PRINTIFY_API_KEY}"}
+    if extra_headers:
+        headers.update(extra_headers)
+    resp = requests.post(url, headers=headers, data=data, json=json_data)
+    print(f"[POST] {url} -> {resp.status_code}")
+    return resp
+
+def generate_title(file_name):
+    name = os.path.splitext(file_name)[0]
+    name = re.sub(r"[-_]", " ", name)
+    return f"{name.title()} Tee"
+
+def generate_description(file_name):
+    title = generate_title(file_name)
+    return (
+        f"Show off your style with this unique {title}. "
+        "Perfect for casual wear and gift ideas. "
+        "High-quality print on a comfy Gildan 5000 tee."
+    )
+
+def generate_tags(file_name):
+    name = os.path.splitext(file_name)[0]
+    words = re.split(r"[-_ ]", name.lower())
+    tags = [w for w in dict.fromkeys(words) if w]  # remove duplicates & empties
+    return tags[:13]
+
+def upload_design(file_path):
+    """
+    Uploads image using JSON payload: { file_name, contents (base64) }
+    """
+    url = "https://api.printify.com/v1/uploads/images.json"
+    file_name = os.path.basename(file_path)
+
+    with open(file_path, "rb") as f:
+        raw = f.read()
+
+    b64_contents = base64.b64encode(raw).decode("utf-8")
+    payload = {"file_name": file_name, "contents": b64_contents}
+
+    resp = api_post(url, json_data=payload, extra_headers={"Content-Type": "application/json"})
+
+    try:
+        data = resp.json()
+        print("Upload response JSON:", json.dumps(data, indent=2))
+    except ValueError:
+        print("Upload response text:", resp.text)
+        return None
+
+    if resp.status_code in (200, 201):
+        file_id = data.get("id")
+        if file_id:
+            return file_id
+        else:
+            print(f"Upload succeeded but no 'id' in response for {file_path}")
+            return None
+    else:
+        print(f"Upload failed for {file_path}: {resp.status_code} {resp.text}")
+        return None
+
+def create_product(shop_id, file_id, title, description, tags, price, variant_ids, blueprint_id, provider_id):
+    """
+    shop_id: your Printify shop id
+    file_id: uploaded design file id
+    variant_ids: list of valid variant IDs for this blueprint + provider
+    blueprint_id: dynamically found blueprint id
+    provider_id: dynamically found provider id
+    """
+    url = f"https://api.printify.com/v1/shops/{shop_id}/products.json"
+
+    # Apply to all variants for now
+    data = {
+        "title": title,
+        "description": description,
+        "tags": tags,
+        "blueprint_id": blueprint_id,
+        "print_provider_id": provider_id,
+        "variants": [
+            {
+                "id": vid,
+                "price": price
+            } for vid in variant_ids
+        ],
+        "print_areas": [
+            {
+                "variant_ids": variant_ids,
+                "placeholders": [
+                    {
+                        "position": "front",
+                        "images": [
+                            {
+                                "id": file_id,
+                                "type": "default",
+                                "x": 0.5,
+                                "y": 0.5,
+                                "scale": 1.0,
+                                "angle": 0
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+
+    resp = api_post(url, json_data=data, extra_headers={"Content-Type": "application/json"})
+
+    try:
+        resp_json = resp.json()
+        print("Create product response JSON:", json.dumps(resp_json, indent=2))
+    except ValueError:
+        print("Create product response text:", resp.text)
+        return None
+
+    if resp.status_code == 201:
+        product_id = resp_json.get("id")
+        print(f"✅ Product created: {title} (ID: {product_id})")
+        return product_id
+    else:
+        print(f"❌ Product creation failed for {title}: {resp.status_code} {resp.text}")
+        return None
+
+def publish_product(shop_id, product_id):
+    url = f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}/publish.json"
+    payload = {"publish_to": "etsy"}  # by default: drafts on Etsy
+
+    resp = api_post(url, json_data=payload, extra_headers={"Content-Type": "application/json"})
+
+    if resp.status_code == 200:
+        print(f"✅ Published product ID {product_id} as draft on Etsy")
+    else:
+        print(f"❌ Publish failed for product ID {product_id}: {resp.status_code} {resp.text}")
+
+def get_first_shop_id():
+    url = "https://api.printify.com/v1/shops.json"
+    resp = api_get(url)
+
+    if resp.status_code != 200:
+        print("Failed to fetch shops:", resp.status_code, resp.text)
+        return None
+
+    try:
+        shops = resp.json()
+    except ValueError:
+        print("Failed to parse shops JSON:", resp.text)
+        return None
+
+    if isinstance(shops, list) and shops:
+        shop_id = shops[0].get("id")
+        print("Using shop id:", shop_id)
+        return shop_id
+    else:
+        print("No shops found in response:", shops)
+        return None
+
+def debug_list_blueprints():
+    """Optional helper: print available blueprints so you can find Gildan 5000."""
+    resp = api_get("https://api.printify.com/v1/catalog/blueprints.json")
+    try:
+        data = resp.json()
+        print(json.dumps(data, indent=2))
+    except ValueError:
+        print(resp.text)
+
+def debug_list_providers_for_blueprint(blueprint_id):
+    """Optional helper: list providers and variant_ids for a blueprint."""
+    url = "https://api.printify.com/v1/catalog/print_providers.json"
+    resp = api_get(url)
+    try:
+        data = resp.json()
+        print(json.dumps(data, indent=2))
+    except ValueError:
+        print(resp.text)
+
+
+# ---------------------------
+# MAIN SCRIPT
+# ---------------------------
+
+def main():
+
+    # Dynamically find Gildan 5000 blueprint ID
+    blueprints_resp = api_get("https://api.printify.com/v1/catalog/blueprints.json")
+    blueprints = blueprints_resp.json()
+    blueprint_id = None
+    for bp in blueprints:
+        if BLUEPRINT_NAME.lower() in bp.get("title", "").lower():
+            blueprint_id = bp["id"]
+            print(f"Found blueprint: {bp['title']} (ID: {blueprint_id})")
+            break
+    if not blueprint_id:
+        raise RuntimeError(f"Could not find blueprint with name '{BLUEPRINT_NAME}'")
+
+
+    # Use provider ID 29 (Monster Digital) directly
+    # Dynamically select the first provider with available variants
+    variants_url = f"https://api.printify.com/v1/catalog/blueprints/{blueprint_id}/print_providers.json"
+    variants_resp = api_get(variants_url)
+    variants_data = variants_resp.json()
+    print("\n--- Provider/Variant Data for Blueprint ---")
+    print(json.dumps(variants_data, indent=2))
+    print("--- END ---\n")
+    provider_id = None
+    variant_ids = []
+    provider_title = None
+    for provider in variants_data:
+        vlist = provider.get("variants", [])
+        if vlist:
+            provider_id = provider["id"]
+            provider_title = provider.get("title", str(provider_id))
+            variant_ids = [v["id"] for v in vlist]
+            print(f"Selected provider: {provider_title} (ID: {provider_id}) with {len(variant_ids)} variants.")
+            break
+    if not provider_id or not variant_ids:
+        raise RuntimeError(f"Could not find any provider with variants for blueprint {blueprint_id}")
+
+
+    # Get shop id
+    shop_id = get_first_shop_id()
+    if not shop_id:
+        print("No shop id available; aborting.")
+        return
+
+    # Restrict to one design file for test
+    files = [f for f in os.listdir(DESIGNS_FOLDER) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+    if not files:
+        print("No design files found.")
+        return
+    file_name = files[0]
+    file_path = os.path.join(DESIGNS_FOLDER, file_name)
+    print(f"\nProcessing: {file_name}")
+
+    title = generate_title(file_name)
+    description = generate_description(file_name)
+    tags = generate_tags(file_name)
+    price = 25  # base price
+
+    # Step 1: Upload design
+    file_id = upload_design(file_path)
+    if not file_id:
+        print("Skipping product creation due to upload failure.")
+        return
+    sleep(API_DELAY)
+
+    # Step 2: Create product
+    product_id = create_product(shop_id, file_id, title, description, tags, price, variant_ids, blueprint_id, provider_id)
+    if not product_id:
+        print("Skipping publish due to product creation failure.")
+        return
+    sleep(API_DELAY)
+
+    # Step 3: Publish to Etsy as draft
+    if PUBLISH_DRAFT:
+        publish_product(shop_id, product_id)
+        sleep(API_DELAY)
+
+    print("\nAll done!")
+
+
+if __name__ == "__main__":
+    main()

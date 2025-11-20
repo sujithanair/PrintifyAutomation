@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+# VSCode
+.vscode/
+
+# Mac
+.DS_Store
+
+# Printify/Debug
+blueprints.json
+print_providers.json
+blueprint_*_print_providers.json
+Test_API_key
